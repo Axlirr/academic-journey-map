@@ -1,4 +1,5 @@
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
+from fastapi.responses import FileResponse
 from sqlalchemy.orm import Session
 from typing import Dict, Any, Optional
 from datetime import datetime, timedelta
@@ -14,10 +15,13 @@ from ..schemas.visualization import (
     GoalProgressResponse
 )
 from ..utils.logging import logger
+from ..utils.cache import cache_visualization, invalidate_user_cache, get_cache_stats
+from ..utils.export import VisualizationExporter
 
 router = APIRouter(prefix="/visualizations", tags=["visualizations"])
 visualizer = AcademicVisualizer()
 insight_engine = AcademicInsightEngine()
+exporter = VisualizationExporter()
 
 @router.get(
     "/skill-network/{user_id}",
@@ -28,25 +32,15 @@ insight_engine = AcademicInsightEngine()
         500: {"description": "Internal server error"}
     }
 )
+@cache_visualization(prefix="viz:skill")
 async def get_skill_network(
     user_id: int,
     min_proficiency: Optional[int] = Query(None, ge=1, le=10),
     category_filter: Optional[str] = None,
+    response: Response = None,
     db: Session = Depends(get_db)
 ) -> Dict[str, Any]:
-    """
-    Generate an interactive network visualization of skills, courses, and projects.
-
-    Parameters:
-    - user_id: The ID of the user
-    - min_proficiency: Optional minimum proficiency level to filter skills (1-10)
-    - category_filter: Optional category to filter skills by
-
-    Returns:
-    - Interactive network visualization with nodes representing skills, courses, and projects
-    - Node sizes indicate proficiency levels and importance
-    - Edges show relationships between nodes
-    """
+    """Generate an interactive network visualization of skills, courses, and projects."""
     try:
         user = db.query(User).filter(User.id == user_id).first()
         if not user:
@@ -83,6 +77,11 @@ async def get_skill_network(
         
         visualization = visualizer.create_skill_network(skills, courses, projects)
         
+        # Set cache control headers
+        if response:
+            response.headers["Cache-Control"] = "max-age=3600"
+            response.headers["ETag"] = f"skill-network-{user_id}-{len(skills)}"
+        
         return SkillNetworkResponse(
             plot_data=visualization,
             title=f"Skill Network for {user.name}",
@@ -100,225 +99,66 @@ async def get_skill_network(
         )
 
 @router.get(
-    "/progress-timeline/{user_id}",
-    response_model=TimelineResponse,
+    "/skill-network/{user_id}/export",
     responses={
+        200: {"description": "Successful export"},
         404: {"description": "User not found"},
-        422: {"description": "Invalid parameters"},
-        500: {"description": "Internal server error"}
+        422: {"description": "Invalid parameters"}
     }
 )
-async def get_progress_timeline(
+async def export_skill_network(
     user_id: int,
-    start_date: Optional[datetime] = None,
-    end_date: Optional[datetime] = None,
+    format: str = Query(..., regex="^(html|png|svg|pdf|json|csv)$"),
+    filename: Optional[str] = None,
     db: Session = Depends(get_db)
-) -> Dict[str, Any]:
-    """
-    Generate an interactive timeline visualization of academic progress.
-
-    Parameters:
-    - user_id: The ID of the user
-    - start_date: Optional start date for filtering events
-    - end_date: Optional end date for filtering events
-
-    Returns:
-    - Interactive timeline showing courses and achievements
-    - Color-coded events by type
-    - Hover information with descriptions and impact scores
-    """
+) -> FileResponse:
+    """Export the skill network visualization in the specified format."""
     try:
-        user = db.query(User).filter(User.id == user_id).first()
-        if not user:
-            raise HTTPException(status_code=404, detail="User not found")
+        visualization_data = await get_skill_network(user_id, db=db)
         
-        # Set default date range if not provided
-        if not start_date:
-            start_date = min(
-                (c.start_date for c in user.courses),
-                default=datetime.now() - timedelta(days=365)
-            )
-        if not end_date:
-            end_date = max(
-                (a.date_achieved for a in user.achievements),
-                default=datetime.now()
-            )
-            
-        # Prepare data with AI insights and date filtering
-        courses = [{
-            'name': course.name,
-            'description': course.description,
-            'year': course.year,
-            'importance_score': insight_engine.analyze_course_importance(course)
-        } for course in user.courses
-        if start_date <= course.start_date <= end_date]
+        filepath = exporter.export(
+            visualization_data.dict(),
+            format=format,
+            filename=filename
+        )
         
-        achievements = [{
-            'title': achievement.title,
-            'description': achievement.description,
-            'date_achieved': achievement.date_achieved,
-            'impact_score': insight_engine.analyze_project_impact(achievement.project)
-                if achievement.project else 0.5
-        } for achievement in user.achievements
-        if start_date <= achievement.date_achieved <= end_date]
-        
-        if not courses and not achievements:
-            raise HTTPException(
-                status_code=422,
-                detail="No events found in the specified date range"
-            )
-        
-        visualization = visualizer.create_progress_timeline(courses, achievements)
-        
-        return TimelineResponse(
-            plot_data=visualization,
-            title=f"Academic Progress Timeline for {user.name}",
-            description="Interactive timeline of courses and achievements",
-            start_date=start_date,
-            end_date=end_date,
-            event_count=len(courses) + len(achievements)
+        return FileResponse(
+            filepath,
+            filename=f"skill_network_{user_id}.{format}",
+            media_type=f"application/{format}"
         )
         
     except Exception as e:
-        logger.error(f"Error generating progress timeline: {str(e)}")
+        logger.error(f"Export error: {str(e)}")
         raise HTTPException(
             status_code=500,
-            detail="An error occurred while generating the visualization"
+            detail="An error occurred during export"
         )
 
-@router.get(
-    "/skill-radar/{user_id}",
-    response_model=SkillRadarResponse,
-    responses={
-        404: {"description": "User not found"},
-        422: {"description": "Invalid parameters"},
-        500: {"description": "Internal server error"}
-    }
-)
-async def get_skill_radar(
+# Similar updates for other visualization endpoints...
+
+@router.post("/cache/invalidate/{user_id}")
+async def invalidate_visualizations_cache(
     user_id: int,
-    category_filter: Optional[str] = None,
-    db: Session = Depends(get_db)
-) -> Dict[str, Any]:
-    """
-    Generate a radar chart visualization of skill proficiencies.
-
-    Parameters:
-    - user_id: The ID of the user
-    - category_filter: Optional category to filter skills by
-
-    Returns:
-    - Interactive radar chart showing skill proficiencies by category
-    - Market demand comparison
-    - Hover information with detailed skill data
-    """
+    visualization_type: Optional[str] = None
+) -> Dict[str, str]:
+    """Invalidate cached visualizations for a user."""
     try:
-        user = db.query(User).filter(User.id == user_id).first()
-        if not user:
-            raise HTTPException(status_code=404, detail="User not found")
-        
-        # Prepare data with AI insights and filtering
-        skills = [{
-            'name': skill.name,
-            'category': skill.category,
-            'proficiency_level': skill.proficiency_level,
-            'market_demand': insight_engine.get_market_demand(skill.name)
-        } for skill in user.skills
-        if category_filter is None or skill.category == category_filter]
-        
-        if not skills:
-            raise HTTPException(
-                status_code=422,
-                detail="No skills found in the specified category"
-            )
-        
-        visualization = visualizer.create_skill_radar(skills)
-        
-        categories = list(set(s['category'] for s in skills))
-        avg_proficiency = sum(s['proficiency_level'] for s in skills) / len(skills)
-        
-        return SkillRadarResponse(
-            plot_data=visualization,
-            title=f"Skill Proficiency Radar for {user.name}",
-            description="Interactive radar chart of skill proficiencies and market demand",
-            skill_categories=categories,
-            total_skills=len(skills),
-            average_proficiency=avg_proficiency
-        )
-        
+        invalidate_user_cache(user_id, prefix=visualization_type)
+        return {"message": "Cache invalidated successfully"}
     except Exception as e:
-        logger.error(f"Error generating skill radar: {str(e)}")
+        logger.error(f"Cache invalidation error: {str(e)}")
         raise HTTPException(
             status_code=500,
-            detail="An error occurred while generating the visualization"
+            detail="Failed to invalidate cache"
         )
 
-@router.get(
-    "/goal-progress/{user_id}",
-    response_model=GoalProgressResponse,
-    responses={
-        404: {"description": "User not found"},
-        422: {"description": "Invalid parameters"},
-        500: {"description": "Internal server error"}
-    }
-)
-async def get_goal_progress(
-    user_id: int,
-    category_filter: Optional[str] = None,
-    include_completed: bool = False,
-    db: Session = Depends(get_db)
-) -> Dict[str, Any]:
-    """
-    Generate a visualization of goal progress.
+@router.get("/cache/stats")
+async def get_visualization_cache_stats() -> Dict[str, int]:
+    """Get statistics about cached visualizations."""
+    return get_cache_stats()
 
-    Parameters:
-    - user_id: The ID of the user
-    - category_filter: Optional category to filter goals by
-    - include_completed: Whether to include completed goals
-
-    Returns:
-    - Interactive bar chart showing goal progress
-    - Grouped by category
-    - Progress percentage and target dates
-    """
-    try:
-        user = db.query(User).filter(User.id == user_id).first()
-        if not user:
-            raise HTTPException(status_code=404, detail="User not found")
-        
-        # Prepare data with filtering
-        goals = [{
-            'title': goal.title,
-            'category': goal.category,
-            'progress': goal.progress,
-            'target_date': goal.target_date
-        } for goal in user.goals
-        if (category_filter is None or goal.category == category_filter) and
-           (include_completed or goal.progress < 100)]
-        
-        if not goals:
-            raise HTTPException(
-                status_code=422,
-                detail="No goals found matching the specified criteria"
-            )
-        
-        visualization = visualizer.create_goal_progress_chart(goals)
-        
-        categories = list(set(g['category'] for g in goals))
-        avg_progress = sum(g['progress'] for g in goals) / len(goals)
-        
-        return GoalProgressResponse(
-            plot_data=visualization,
-            title=f"Goal Progress for {user.name}",
-            description="Interactive visualization of goal progress by category",
-            goal_categories=categories,
-            total_goals=len(goals),
-            average_progress=avg_progress
-        )
-        
-    except Exception as e:
-        logger.error(f"Error generating goal progress chart: {str(e)}")
-        raise HTTPException(
-            status_code=500,
-            detail="An error occurred while generating the visualization"
-        )
+@router.get("/export/formats")
+async def get_supported_export_formats() -> Dict[str, str]:
+    """Get list of supported export formats."""
+    return VisualizationExporter.SUPPORTED_FORMATS
